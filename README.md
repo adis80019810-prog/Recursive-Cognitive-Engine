@@ -51,7 +51,7 @@ All behaviour is controlled via environment variables:
 |----------|-------------|---------|
 | `OBSIDIAN_VAULT_PATH` | Absolute path to your Obsidian vault | *Required* |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key | *Required* |
-| `CLAUDE_MODEL` | Model to use (e.g., `claude-3-5-sonnet-20241022`) | `claude-sonnet-4-6` (⚠️ set this) |
+| `CLAUDE_MODEL` | Model to use (recommended: `claude-opus-4-7` for decomposition, `claude-sonnet-4-6` for council) | `claude-opus-4-7` |
 | `MASTER_ARCHITECT_PROMPT_PATH` | Path to file containing the decomposition prompt | Falls back to inline minimal prompt |
 | `HUMAN_REVIEW_ENABLED` | `true` to pause for manual approval | `false` |
 | `SNAPSHOT_CACHE_MINUTES` | How long to cache vault snapshot | `5` |
