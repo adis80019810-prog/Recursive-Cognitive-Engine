@@ -1,0 +1,18 @@
+# Environment variables
+.env
+
+# Obsidian workspace files
+.obsidian/
+*.workspace
+
+# n8n execution data
+n8n/
+~*.json
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.processing
