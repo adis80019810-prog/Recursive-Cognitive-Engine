@@ -1,4 +1,4 @@
-![RCE Banner](Recursive%20Cognitive%20Engine%20(Banner).png)
+![RCE Banner]()
 # Recursive Cognitive Engine (RCE)
 
 > A production‑grade n8n workflow that transforms your Obsidian vault into a self‑organising, AI‑curated second brain.
