@@ -1,0 +1,273 @@
+
+  "name": "RCE-03-Write-Vault",
+  "nodes": [
+    {
+      "id": "n-b2438ca7dac9",
+      "name": "When Called by Decompose",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n-d545af41ac90",
+      "name": "Split Notes for Writing",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        340,
+        300
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      }
+    },
+    {
+      "id": "n-b8a3a8858a98",
+      "name": "Write Note to Vault",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst crypto = require('crypto');\nconst cfg = getConfig();\nconst { vaultPath, maxVersions } = cfg;\nconst resolvedVault = _path.resolve(vaultPath);\nconst note = $input.item.json;\nconst batchId = note._batch_id || 'unknown';\nconst t0 = Date.now();\n\nconst safeFilename = sanitizeFilename(note.filename || 'untitled.md');\nconst rawFolder = (note.folder || '01_Wiki_Nodes').replace(/\\.\\.[\\/\\\\]/g, '').replace(/^[\\/\\\\]+/, '');\nconst targetFolder = validateVaultPath(_path.join(resolvedVault, rawFolder), resolvedVault);\n_fs.mkdirSync(targetFolder, { recursive: true });\nconst fullPath = _path.join(targetFolder, safeFilename);\nvalidateVaultPath(fullPath, resolvedVault);\n\nconst newContent = note.content || '';\nconst newHash = crypto.createHash('sha256').update(newContent, 'utf8').digest('hex').substring(0, 16);\n\nlet action = 'created';\n\n// Dedup: fuzzy slug match against existing files\nfunction extractSlug(fn) { return fn.replace(/^\\d+_/, '').replace(/\\.md$/, '').replace(/[-_]/g, ' ').toLowerCase(); }\nconst newSlug = extractSlug(safeFilename);\n\nif (_fs.existsSync(fullPath)) {\n  // Exact match — version and overwrite\n  const existing = _fs.readFileSync(fullPath, 'utf8');\n  const existHash = crypto.createHash('sha256').update(existing, 'utf8').digest('hex').substring(0, 16);\n  if (existHash === newHash) {\n    slog(vaultPath, 'Write-Note', 'info', 'Identical content — skipped', batchId, { file: safeFilename });\n    return { json: { ...note, _write_action: 'skipped_identical', _write_path: fullPath }};\n  }\n  // Version the old file\n  const versDir = _path.join(targetFolder, '.versions');\n  _fs.mkdirSync(versDir, { recursive: true });\n  const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);\n  _fs.writeFileSync(_path.join(versDir, `${safeFilename}.${ts}.bak`), existing, 'utf8');\n  // Prune old versions\n  const baks = _fs.readdirSync(versDir).filter(f => f.startsWith(safeFilename)).sort();\n  if (baks.length > maxVersions)\n    baks.slice(0, baks.length - maxVersions).forEach(f => { try { _fs.unlinkSync(_path.join(versDir, f)); } catch (_) {} });\n  action = 'versioned';\n} else {\n  // Check fuzzy duplicates (70% word overlap threshold with minimum note count guard)\n  try {\n    const parentContents = _fs.readdirSync(targetFolder).filter(f => f.endsWith('.md'));\n    const nW = new Set(newSlug.split(' ').filter(w => w.length > 3));\n    if (nW.size > 2) { // Only do fuzzy match when slug has enough words\n      for (const ef of parentContents) {\n        const eSlug = extractSlug(ef);\n        const eW = new Set(eSlug.split(' ').filter(w => w.length > 3));\n        if (eW.size < 2) continue;\n        const overlap = [...nW].filter(w => eW.has(w)).length / Math.max(nW.size, eW.size);\n        if (overlap >= 0.75) { // Raised threshold to reduce false positives\n          slog(vaultPath, 'Write-Note', 'warn', 'Fuzzy duplicate detected: ' + ef, batchId, { overlap });\n          action = 'fuzzy_duplicate_skipped';\n          return { json: { ...note, _write_action: action, _duplicate_of: ef }};\n        }\n      }\n    }\n  } catch (_) {}\n}\n\n// Atomic write: write to .tmp then rename\nconst tmpPath = fullPath + '.tmp';\n_fs.writeFileSync(tmpPath, newContent, 'utf8');\n_fs.renameSync(tmpPath, fullPath); // Atomic on POSIX\n\nconst elapsed = Date.now() - t0;\nslog(vaultPath, 'Write-Note', 'info', action + ': ' + safeFilename, batchId, { elapsed_ms: elapsed });\nreturn { json: { ...note, _write_action: action, _write_path: fullPath, _content_hash: newHash }};\n"
+      }
+    },
+    {
+      "id": "n-a78e4460420c",
+      "name": "Write Processing Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst data = $input.item.json;\nconst batchId = data._batch_id || 'unknown';\nconst logDir = _path.join(vaultPath, '04_Meta');\n_fs.mkdirSync(logDir, { recursive: true });\nconst ts = new Date().toISOString();\nconst entry = JSON.stringify({\n  ts, batchId,\n  source: data.source_title || 'Unknown',\n  notes: (data.notes || []).length,\n  status: 'complete',\n  tokens: { input: data.usage?.input_tokens || null, output: data.usage?.output_tokens || null },\n  content_hash: data._content_hash || null,\n  duration_ms: data._api_duration_ms || null\n});\n_fs.appendFileSync(_path.join(logDir, 'processing_log.jsonl'), entry + '\\n', 'utf8');\n\n// Markdown table row\nconst mdLine = `| ${ts} | ${data.source_title || 'Unknown'} | ${(data.notes||[]).length} | ${data.usage?.input_tokens||'-'} | ${data.usage?.output_tokens||'-'} |\\n`;\nconst mdPath = _path.join(logDir, 'processing_log.md');\nif (!_fs.existsSync(mdPath))\n  _fs.writeFileSync(mdPath, '| Date | Source | Notes | In Tokens | Out Tokens |\\n|------|--------|-------|-----------|------------|\\n');\n_fs.appendFileSync(mdPath, mdLine);\nslog(vaultPath, 'Write-Log', 'info', 'Processing log updated', batchId);\nreturn { json: data };\n"
+      }
+    },
+    {
+      "id": "n-1aa9dadb4a1c",
+      "name": "Archive Source File",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst crypto = require('crypto');\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst data = $input.item.json;\nconst batchId = data._batch_id || 'unknown';\nconst sourcePath = data._source_path || data.path || '';\n\nif (!sourcePath || !_fs.existsSync(sourcePath)) {\n  slog(vaultPath, 'Write-ArchiveSource', 'info', 'Source not found — skipping', batchId);\n  return { json: { ...data, _archive_status: 'skipped_not_found' }};\n}\n\nlet checksum = null;\ntry { checksum = crypto.createHash('sha256').update(_fs.readFileSync(sourcePath)).digest('hex'); }\ncatch (_) {}\n\nconst archiveDir = _path.join(vaultPath, '05_Sources');\n_fs.mkdirSync(archiveDir, { recursive: true });\nconst cleanBase = _path.basename(sourcePath).replace(/\\.processing$/, '');\nconst datestamp = new Date().toISOString().split('T')[0];\nconst dest = _path.join(archiveDir, `${datestamp}_${cleanBase}`);\n\n// Atomic archive using rename\n_fs.renameSync(sourcePath, dest);\n\n// Write sidecar metadata\nconst sidecar = {\n  original_path: data._source_path,\n  archived_at: new Date().toISOString(),\n  batch_id: batchId,\n  sha256: checksum,\n  notes_created: (data.notes || []).length\n};\n_fs.writeFileSync(dest + '.meta.json', JSON.stringify(sidecar, null, 2));\n\nslog(vaultPath, 'Write-ArchiveSource', 'info', 'Archived: ' + cleanBase, batchId, { dest, checksum });\nreturn { json: { ...data, _archive_path: dest, _archive_status: 'archived' }};\n"
+      }
+    },
+    {
+      "id": "n-8caec8af77ab",
+      "name": "Release Lock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst data = $input.item.json;\nconst lockPath = data._lock_path || '';\nif (lockPath && _fs.existsSync(lockPath)) {\n  try { _fs.unlinkSync(lockPath); }\n  catch (e) { console.warn('[Write-ReleaseLock] Cannot remove lock:', e.message); }\n}\nreturn { json: data };\n"
+      }
+    },
+    {
+      "id": "n-b07e1947f219",
+      "name": "Update Processed Index",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst data = $input.item.json;\nconst batchId = data._batch_id || 'unknown';\nconst indexPath = _path.join(vaultPath, '04_Meta', 'processed_index.json');\n\nlet idx = {};\ntry { if (_fs.existsSync(indexPath)) idx = JSON.parse(_fs.readFileSync(indexPath, 'utf8')); }\ncatch (_) {}\n\nidx[batchId] = {\n  processed_at: new Date().toISOString(),\n  source_title: data.source_title || 'Unknown',\n  notes_count: (data.notes || []).length,\n  content_hash: data._content_hash || null\n};\n\n// Keep index from growing unbounded — prune entries older than 90 days\nconst cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;\nfor (const key of Object.keys(idx)) {\n  if (new Date(idx[key].processed_at).getTime() < cutoff) delete idx[key];\n}\n\n_fs.writeFileSync(indexPath, JSON.stringify(idx, null, 2));\n\n// Also invalidate snapshot cache so next run sees new notes\nconst cacheFile = _path.join(vaultPath, '04_Meta', '.snapshot_cache.json');\ntry { if (_fs.existsSync(cacheFile)) _fs.unlinkSync(cacheFile); } catch (_) {}\n\nreturn { json: data };\n"
+      }
+    },
+    {
+      "id": "n-7d83a0e39765",
+      "name": "Write Completion Note",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst data = $input.item.json;\nconst batchId = data._batch_id || 'unknown';\nconst source = data.source_title || data.filename || 'Unknown';\nconst date = new Date().toISOString().split('T')[0];\nconst noteCount = (data.notes || []).length;\n\nconst content = `---\ntitle: \"Processed: ${source}\"\ndate: \"${date}\"\ntags: [processing-complete]\nbatch_id: \"${batchId}\"\n---\n\n# Processed: ${source}\n\n| Field | Value |\n|-------|-------|\n| Source | ${source} |\n| Batch | \\`${batchId}\\` |\n| Notes created | ${noteCount} |\n| Content hash | \\`${data._content_hash || 'n/a'}\\` |\n| Archive | \\`${data._archive_path || 'n/a'}\\` |\n| Duration | ${data._api_duration_ms ? data._api_duration_ms + 'ms' : 'n/a'} |\n`;\n\nconst metaDir = _path.join(vaultPath, '04_Meta', 'completed');\n_fs.mkdirSync(metaDir, { recursive: true });\nconst ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);\nconst notePath = _path.join(metaDir, `completed_${ts}.md`);\n_fs.writeFileSync(notePath, content, 'utf8');\nslog(vaultPath, 'Write-Completion', 'info', 'Processing complete: ' + source, batchId, { noteCount });\n\nreturn { json: { status: 'complete', batch_id: batchId, notes_written: noteCount, source }};\n"
+      }
+    },
+    {
+      "id": "n-6c7724a63830",
+      "name": "Council Debate Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2020,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $env.COUNCIL_DEBATE_ENABLED }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n-65f140a7a67f",
+      "name": "Call: RCE-04-Council",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2260,
+        200
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "RCE-04-Council"
+        },
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When Called by Decompose": {
+      "main": [
+        [
+          {
+            "node": "Split Notes for Writing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Notes for Writing": {
+      "main": [
+        [
+          {
+            "node": "Write Note to Vault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Note to Vault": {
+      "main": [
+        [
+          {
+            "node": "Write Processing Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Processing Log": {
+      "main": [
+        [
+          {
+            "node": "Archive Source File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Archive Source File": {
+      "main": [
+        [
+          {
+            "node": "Release Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release Lock": {
+      "main": [
+        [
+          {
+            "node": "Update Processed Index",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Processed Index": {
+      "main": [
+        [
+          {
+            "node": "Write Completion Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Completion Note": {
+      "main": [
+        [
+          {
+            "node": "Council Debate Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Council Debate Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Call: RCE-04-Council",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "RCE-00-Error-Handler",
+    "timezone": "Asia/Kolkata"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "versionId": "a36e2824-6b2b-49c8-8592-ba230771748c"
+}

@@ -1,0 +1,193 @@
+{
+  "name": "RCE-Janitor-v4",
+  "nodes": [
+    {
+      "id": "n-6c8636c57943",
+      "name": "Weekly Janitor Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * 0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n-4659b0f0db87",
+      "name": "Health Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst checks = {};\n\n// Check vault dirs exist\nconst requiredDirs = ['00_Inbox', '01_Wiki_Nodes', '04_Meta', '05_Sources'];\nfor (const d of requiredDirs) {\n  const p = _path.join(vaultPath, d);\n  checks[d] = { exists: _fs.existsSync(p), writable: false };\n  if (checks[d].exists) {\n    try {\n      const testFile = _path.join(p, '.health_check_' + Date.now());\n      _fs.writeFileSync(testFile, 'ok');\n      _fs.unlinkSync(testFile);\n      checks[d].writable = true;\n    } catch (_) {}\n  }\n}\n\n// Inbox queue depth\nconst inboxDir = _path.join(vaultPath, '00_Inbox');\nlet queueDepth = 0, staleProcessing = 0, orphanedLocks = 0;\ntry {\n  const files = _fs.readdirSync(inboxDir);\n  for (const f of files) {\n    if (!f.startsWith('_') && !f.startsWith('.')) {\n      if (f.endsWith('.processing')) {\n        staleProcessing++;\n      } else if (f.endsWith('.lock')) {\n        orphanedLocks++;\n      } else {\n        queueDepth++;\n      }\n    }\n  }\n} catch (_) {}\n\n// Log metrics\nconst logPath = _path.join(vaultPath, '04_Meta', 'structured.log');\nlet logSizeKb = 0;\ntry { logSizeKb = Math.round(_fs.statSync(logPath).size / 1024); } catch (_) {}\n\nreturn { json: {\n  ts: new Date().toISOString(), checks, queueDepth,\n  staleProcessing, orphanedLocks, logSizeKb\n}};\n"
+      }
+    },
+    {
+      "id": "n-71a4591c70b9",
+      "name": "Age-Based File Pruning",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst STAGING_MAX_AGE_HOURS = 48;\nconst FAILED_MAX_AGE_DAYS = 7;\nconst ERROR_LOG_MAX_AGE_DAYS = 30;\nconst now = Date.now();\nconst report = { staged_pruned: 0, failed_pruned: 0, error_logs_pruned: 0, lock_files_freed: 0 };\n\n// Prune stale staging previews\nconst stagingDir = _path.join(vaultPath, '04_Meta', '_staging');\ntry {\n  for (const f of _fs.readdirSync(stagingDir)) {\n    if (!f.endsWith('.md')) continue;\n    const fp = _path.join(stagingDir, f);\n    const age = now - _fs.statSync(fp).mtimeMs;\n    if (age > STAGING_MAX_AGE_HOURS * 3600000) {\n      _fs.unlinkSync(fp);\n      report.staged_pruned++;\n    }\n  }\n} catch (_) {}\n\n// Prune old _failed files\nconst failedDir = _path.join(vaultPath, '00_Inbox', '_failed');\ntry {\n  for (const f of _fs.readdirSync(failedDir)) {\n    const fp = _path.join(failedDir, f);\n    const age = now - _fs.statSync(fp).mtimeMs;\n    if (age > FAILED_MAX_AGE_DAYS * 86400000) {\n      _fs.unlinkSync(fp);\n      report.failed_pruned++;\n    }\n  }\n} catch (_) {}\n\n// Free orphaned .lock files > 1 hour old\nconst inboxDir = _path.join(vaultPath, '00_Inbox');\ntry {\n  for (const f of _fs.readdirSync(inboxDir)) {\n    if (!f.endsWith('.lock')) continue;\n    const fp = _path.join(inboxDir, f);\n    const age = now - _fs.statSync(fp).mtimeMs;\n    if (age > 3600000) { // 1 hour\n      _fs.unlinkSync(fp);\n      report.lock_files_freed++;\n      slog(vaultPath, 'Janitor-AgePruning', 'warn', 'Freed orphaned lock: ' + f, 'janitor');\n    }\n  }\n} catch (_) {}\n\nreturn { json: { ...$input.item.json, age_pruning: report }};\n"
+      }
+    },
+    {
+      "id": "n-8d196f34004d",
+      "name": "Orphan Detection + Log Rotate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst report = { orphaned_metas: 0, broken_links_sample: [] };\n\n// Check cemetery for orphaned references\nconst cemDir = _path.join(vaultPath, '03_Lesson_Cemetery');\ntry {\n  const files = _fs.readdirSync(cemDir).filter(f => f.endsWith('.md'));\n  for (const f of files) {\n    const content = _fs.readFileSync(_path.join(cemDir, f), 'utf8');\n    const origMatch = content.match(/original_file:\\s*\"([^\"]+)\"/);\n    if (origMatch) {\n      const origPath = _path.join(vaultPath, origMatch[1]);\n      if (!_fs.existsSync(origPath)) report.orphaned_metas++;\n    }\n  }\n} catch (_) {}\n\n// Rotate structured.log if > 10MB\nconst logPath = _path.join(vaultPath, '04_Meta', 'structured.log');\ntry {\n  const stat = _fs.statSync(logPath);\n  if (stat.size > 10 * 1024 * 1024) {\n    const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);\n    _fs.renameSync(logPath, logPath + '.' + ts + '.bak');\n    slog(vaultPath, 'Janitor-OrphanDetect', 'info', 'Log rotated (was ' + Math.round(stat.size / 1024 / 1024) + 'MB)', 'janitor');\n  }\n} catch (_) {}\n\nreturn { json: { ...$input.item.json, orphan_detection: report }};\n"
+      }
+    },
+    {
+      "id": "n-08ab4b834e57",
+      "name": "Lock File Cleanup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\n// Additional: find any .processing files without a corresponding .lock (process died after rename but before lock creation)\n// and move them back to recoverable state\nconst inboxDir = _path.join(vaultPath, '00_Inbox');\nconst recovered = [];\ntry {\n  for (const f of _fs.readdirSync(inboxDir)) {\n    if (!f.endsWith('.processing')) continue;\n    const procPath = _path.join(inboxDir, f);\n    const lockPath = procPath + '.lock'; // Wait - the lock is on original name, not .processing\n    // Actually check age of .processing file\n    const age = Date.now() - _fs.statSync(procPath).mtimeMs;\n    if (age > 2 * 3600000) { // 2 hours without lock = likely abandoned\n      const base = f.replace(/\\.processing$/, '');\n      const recDir = _path.join(vaultPath, '00_Inbox', '_recovered');\n      _fs.mkdirSync(recDir, { recursive: true });\n      _fs.renameSync(procPath, _path.join(recDir, base));\n      recovered.push(base);\n      slog(vaultPath, 'Janitor-LockCleanup', 'warn', 'Recovered abandoned .processing: ' + base, 'janitor');\n    }\n  }\n} catch (_) {}\nreturn { json: { ...$input.item.json, lock_cleanup: { recovered: recovered.length, files: recovered }}};\n"
+      }
+    },
+    {
+      "id": "n-3b348110620c",
+      "name": "Build and Send Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst data = $input.item.json;\nconst checks = data.checks || {};\nconst failing = Object.entries(checks).filter(([,v]) => !v.writable).map(([k]) => k);\nconst report = {\n  ts: new Date().toISOString(),\n  queue_depth: data.queueDepth || 0,\n  stale_processing: data.staleProcessing || 0,\n  orphaned_locks: data.orphanedLocks || 0,\n  age_pruning: data.age_pruning || {},\n  orphan_detection: data.orphan_detection || {},\n  lock_cleanup: data.lock_cleanup || {},\n  failing_dir_checks: failing,\n  log_size_kb: data.logSizeKb || 0\n};\nreturn { json: report };\n"
+      }
+    },
+    {
+      "id": "n-8453c785004e",
+      "name": "Janitor Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        500
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n-62958da4b69b",
+      "name": "Log Janitor Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        500
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst e=$input.item.json;slog(process.env.OBSIDIAN_VAULT_PATH||'/tmp','Janitor','error',e.error?.message||'unknown','janitor');return{json:e};"
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Janitor Schedule": {
+      "main": [
+        [
+          {
+            "node": "Health Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Health Check": {
+      "main": [
+        [
+          {
+            "node": "Age-Based File Pruning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Age-Based File Pruning": {
+      "main": [
+        [
+          {
+            "node": "Orphan Detection + Log Rotate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Orphan Detection + Log Rotate": {
+      "main": [
+        [
+          {
+            "node": "Lock File Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lock File Cleanup": {
+      "main": [
+        [
+          {
+            "node": "Build and Send Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Janitor Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Janitor Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "RCE-Janitor-v4",
+    "timezone": "Asia/Kolkata"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "versionId": "7b5dac36-391f-45fe-8dc8-4d68d10532f0"
+}

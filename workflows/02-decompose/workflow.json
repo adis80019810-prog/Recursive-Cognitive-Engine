@@ -1,0 +1,327 @@
+
+  "name": "RCE-02-Decompose",
+  "nodes": [
+    {
+      "id": "n-5ca4d37a46aa",
+      "name": "When Called by Ingestion",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n-af4ec720e488",
+      "name": "Build Vault Snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath, cacheMaxAge } = cfg;\nconst cacheFile = _path.join(vaultPath, '04_Meta', '.snapshot_cache.json');\nconst MAX_FILES = 10000;\nlet snapshot = null;\n\n// Use cached snapshot if fresh\ntry {\n  if (_fs.existsSync(cacheFile)) {\n    const c = JSON.parse(_fs.readFileSync(cacheFile, 'utf8'));\n    if (Date.now() - new Date(c.cached_at).getTime() < cacheMaxAge) {\n      snapshot = c.snapshot;\n    }\n  }\n} catch (_) {}\n\nif (!snapshot) {\n  // Build compact titles-only index (avoids loading full file contents)\n  function scanDir(dir, base) {\n    base = base || '';\n    let out = [];\n    if (!_fs.existsSync(dir)) return out;\n    let items;\n    try { items = _fs.readdirSync(dir); } catch (_) { return out; }\n    for (const item of items) {\n      const full = _path.join(dir, item), rel = _path.join(base, item);\n      let stat;\n      try { stat = _fs.statSync(full); } catch (_) { continue; }\n      if (stat.isDirectory() && !item.startsWith('.') && !item.startsWith('_'))\n        out = out.concat(scanDir(full, rel));\n      else if (item.endsWith('.md') && !item.startsWith('_'))\n        out.push({ rel, slug: item.replace(/\\.md$/, '').replace(/[_-]+/g, ' ').toLowerCase() });\n    }\n    return out;\n  }\n  snapshot = scanDir(vaultPath).slice(0, MAX_FILES);\n  try {\n    _fs.mkdirSync(_path.dirname(cacheFile), { recursive: true });\n    _fs.writeFileSync(cacheFile, JSON.stringify({ cached_at: new Date().toISOString(), snapshot }));\n  } catch (_) {}\n}\n\nreturn { json: { ...$input.item.json, _vault_snapshot: snapshot, _snapshot_size: snapshot.length }};\n"
+      }
+    },
+    {
+      "id": "n-48f23637be49",
+      "name": "Claude: Decompose Source",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst https = require('https');\nconst cfg = getConfig();\nconst { vaultPath, apiKey, model, maxTokens, maxRetries } = cfg;\nconst data = $input.item.json;\nconst batchId = data._batch_id || 'unknown';\nconst text = data.text || '';\nconst snapshot = data._vault_snapshot || [];\n\nconst SYSTEM_PROMPT = `You are the Recursive Cognitive Engine (RCE), an expert knowledge-management AI for Obsidian second-brain systems.\n\nTASK: Decompose the source document into 8-12 interconnected atomic Zettelkasten notes.\n\nRETURN: One valid JSON object only — no prose, no markdown fences, no explanation.\n\nJSON SCHEMA (all fields required):\n{\n  \"batch_id\": \"<ISO timestamp>\",\n  \"source_title\": \"<title string>\",\n  \"council_debate_summary\": \"<2-3 sentence overview>\",\n  \"notes\": [\n    {\n      \"filename\": \"01_Slug.md\",\n      \"folder\": \"01_Wiki_Nodes\",\n      \"title\": \"<note title>\",\n      \"content\": \"<full markdown note content with frontmatter>\",\n      \"links\": [\"[[Other Note]]\"],\n      \"tags\": [\"tag1\",\"tag2\"]\n    }\n  ],\n  \"lesson_cemetery_candidates\": [],\n  \"experiment_24h\": { \"title\": \"\", \"hypothesis\": \"\", \"steps\": [], \"success_metric\": \"\" }\n}\n\nEXISTING VAULT NOTES (avoid duplicates, prefer linking):\n${JSON.stringify(snapshot.slice(0, 200).map(n => n.rel), null, 0)}`;\n\n// Construct messages (system = instructions, user = data only — FIX: no dual-prompt)\nconst messages = [\n  {\n    role: 'user',\n    content: `<source-document>\\n${text}\\n</source-document>`\n  }\n];\n\nfunction callClaude(attempt) {\n  return new Promise((resolve, reject) => {\n    const payload = JSON.stringify({ model, max_tokens: maxTokens, system: SYSTEM_PROMPT, messages });\n    const opts = {\n      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',\n      headers: {\n        'x-api-key': apiKey, 'anthropic-version': '2023-06-01',\n        'content-type': 'application/json', 'content-length': Buffer.byteLength(payload)\n      }\n    };\n    const req = https.request(opts, res => {\n      let body = '';\n      res.on('data', d => body += d);\n      res.on('end', () => {\n        if (res.statusCode === 200) resolve(JSON.parse(body));\n        else if ([429, 529].includes(res.statusCode) && attempt < maxRetries) {\n          const wait = Math.pow(2, attempt) * 1000;\n          setTimeout(() => callClaude(attempt + 1).then(resolve).catch(reject), wait);\n        } else reject(new Error('[Decompose] Claude API error ' + res.statusCode + ': ' + body.substring(0, 200)));\n      });\n    });\n    req.on('error', reject);\n    req.write(payload);\n    req.end();\n  });\n}\n\nconst t0 = Date.now();\nconst response = await callClaude(1);\nconst duration = Date.now() - t0;\n\nslog(vaultPath, 'Decompose-Claude', 'info', 'Claude API call complete', batchId, {\n  model, duration_ms: duration,\n  input_tokens: response.usage?.input_tokens,\n  output_tokens: response.usage?.output_tokens\n});\n\nreturn { json: { ...data, ...response, _batch_id: batchId, _api_duration_ms: duration }};\n"
+      }
+    },
+    {
+      "id": "n-6a71d2f8fd22",
+      "name": "Parse and Validate Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst crypto = require('crypto');\nconst response = $input.item.json;\nconst batchId = response._batch_id || 'unknown';\n\nlet rawText = '';\nif (response.content && Array.isArray(response.content))\n  rawText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');\nelse if (typeof response === 'string') rawText = response;\n\n// Strip markdown fences if Claude wrapped the JSON\nrawText = rawText.replace(/^```json\\s*/i, '').replace(/```\\s*$/i, '').trim();\n\nlet parsed;\ntry { parsed = JSON.parse(rawText); }\ncatch (e) {\n  const m = rawText.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {\n    throw new Error('[Decompose-ParseResponse] JSON parse failed: ' + e2.message + ' | raw: ' + rawText.substring(0, 300));\n  }}\n  else throw new Error('[Decompose-ParseResponse] No JSON in response. Got: ' + rawText.substring(0, 200));\n}\n\n// Schema validation\nif (!parsed.notes || !Array.isArray(parsed.notes))\n  throw new Error('[Decompose-ParseResponse] \"notes\" must be an array');\nif (parsed.notes.length === 0)\n  throw new Error('[Decompose-ParseResponse] \"notes\" array is empty');\nif (parsed.notes.length > 20)\n  throw new Error('[Decompose-ParseResponse] Too many notes: ' + parsed.notes.length);\n\n// Sanitize + deduplicate filenames\nconst seenFiles = new Set();\nfor (const note of parsed.notes) {\n  if (!note.filename || !note.content)\n    throw new Error('[Decompose-ParseResponse] Note missing filename or content');\n  // Normalize filename\n  note.filename = note.filename.endsWith('.md') ? note.filename : note.filename + '.md';\n  note.filename = note.filename.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-');\n  if (seenFiles.has(note.filename))\n    note.filename = note.filename.replace(/\\.md$/, '_' + crypto.randomBytes(3).toString('hex') + '.md');\n  seenFiles.add(note.filename);\n}\n\nconst contentHash = crypto.createHash('sha256')\n  .update(JSON.stringify(parsed.notes)).digest('hex').substring(0, 16);\n\nreturn { json: {\n  ...response, ...parsed,\n  _batch_id: batchId,\n  _content_hash: contentHash,\n  _notes_count: parsed.notes.length\n}};\n"
+      }
+    },
+    {
+      "id": "n-96fb6646b103",
+      "name": "Write Staging Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst _fs = require('fs'), _path = require('path');\nconst data = $input.item.json;\nconst vaultPath = process.env.OBSIDIAN_VAULT_PATH;\nconst batchId = data._batch_id || new Date().toISOString();\nconst safeId = batchId.replace(/[:.]/g, '-').substring(0, 24);\nconst stagingDir = _path.join(vaultPath, '04_Meta', '_staging');\n_fs.mkdirSync(stagingDir, { recursive: true });\n\nconst noteList = (data.notes || []).map((n, i) =>\n  `${i + 1}. \\`${n.folder}/${n.filename}\\` — ${n.title || '(no title)'}`\n).join('\\n');\n\nconst content = `---\ntitle: \"Pending Review: ${data.source_title || 'Unknown'}\"\ndate: \"${new Date().toISOString().split('T')[0]}\"\ntags: [review-pending, ai-generated]\nbatch_id: \"${batchId}\"\n---\n\n# Pending: ${data.source_title || 'Unknown'}\n\n> Batch: \\`${batchId}\\`\n${data.source_truncated ? '> ⚠️ ' + data.truncation_note + '\\n' : ''}\n## Notes to be Written (${(data.notes || []).length})\n\n${noteList}\n\n## Council Summary\n\n${(data.council_debate_summary || '_none_').substring(0, 500)}\n\n---\n*To approve: POST \\`{\"decision\":\"approve\",\"batchId\":\"${batchId}\"}\\` to the webhook.*\n*To reject: POST \\`{\"decision\":\"reject\",\"batchId\":\"${batchId}\"}\\` to the webhook.*\n`;\n\nconst previewPath = _path.join(stagingDir, `review_${safeId}.md`);\n_fs.writeFileSync(previewPath, content, 'utf8');\nreturn { json: { ...data, _staging_preview_path: previewPath, _batch_safe_id: safeId }};\n"
+      }
+    },
+    {
+      "id": "n-68ff6f7b6dac",
+      "name": "Human Review Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $env.HUMAN_REVIEW_ENABLED }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n-0cb9061b50b8",
+      "name": "Send Review Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1540,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JANITOR_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ event: 'review_required', batchId: $json._batch_id, source: $json.source_title, previewPath: $json._staging_preview_path, noteCount: $json._notes_count }) }}"
+      }
+    },
+    {
+      "id": "n-1a177b0c2aac",
+      "name": "Wait for Human Decision",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        1780,
+        200
+      ],
+      "parameters": {
+        "resume": "webhook",
+        "webhookSuffix": "/review-decision",
+        "options": {
+          "webhookSuffix": {
+            "value": "={{ $json._batch_id }}"
+          },
+          "limitWaitTime": true,
+          "limitType": "afterTimeInterval",
+          "resumeAmount": 24,
+          "resumeUnit": "hours"
+        }
+      }
+    },
+    {
+      "id": "n-ce2cfab261dc",
+      "name": "Approved or Rejected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        2020,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.body?.decision || $json.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n-80a21696ed91",
+      "name": "Discard and Reject",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2260,
+        320
+      ],
+      "parameters": {
+        "jsCode": "\nconst _fs = require('fs'), _path = require('path');\nconst vaultPath = process.env.OBSIDIAN_VAULT_PATH;\nconst data = $input.item.json;\nconst previewPath = data._staging_preview_path || data.body?._staging_preview_path;\nconst sourcePath = data._source_path || data.body?._source_path || '';\nconst batchId = data._batch_safe_id || data.body?._batch_safe_id || 'unknown';\nconst lockPath = data._lock_path || data.body?._lock_path || '';\n\nif (previewPath) { try { _fs.unlinkSync(previewPath); } catch (_) {} }\nif (lockPath && _fs.existsSync(lockPath)) { try { _fs.unlinkSync(lockPath); } catch (_) {} }\n\nif (sourcePath && _fs.existsSync(sourcePath)) {\n  const rejDir = _path.join(vaultPath, '00_Inbox', '_rejected');\n  _fs.mkdirSync(rejDir, { recursive: true });\n  const base = _path.basename(sourcePath).replace(/\\.processing$/, '');\n  const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);\n  _fs.renameSync(sourcePath, _path.join(rejDir, ts + '_' + base));\n}\nreturn { json: { status: 'rejected', batch_id: batchId }};\n"
+      }
+    },
+    {
+      "id": "n-3763a48b4b5e",
+      "name": "Call: RCE-03-Write-Vault",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2260,
+        180
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "RCE-03-Write-Vault"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When Called by Ingestion": {
+      "main": [
+        [
+          {
+            "node": "Build Vault Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Vault Snapshot": {
+      "main": [
+        [
+          {
+            "node": "Claude: Decompose Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: Decompose Source": {
+      "main": [
+        [
+          {
+            "node": "Parse and Validate Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Validate Response": {
+      "main": [
+        [
+          {
+            "node": "Write Staging Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Staging Preview": {
+      "main": [
+        [
+          {
+            "node": "Human Review Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Review Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Send Review Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Call: RCE-03-Write-Vault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Review Request": {
+      "main": [
+        [
+          {
+            "node": "Wait for Human Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Human Decision": {
+      "main": [
+        [
+          {
+            "node": "Approved or Rejected?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved or Rejected?": {
+      "main": [
+        [
+          {
+            "node": "Call: RCE-03-Write-Vault",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Discard and Reject",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "RCE-00-Error-Handler",
+    "timezone": "Asia/Kolkata"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "versionId": "18cc2aef-cd5b-40cd-8f04-902ad6769c60"
+}

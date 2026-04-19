@@ -1,0 +1,114 @@
+{
+  "name": "RCE-00-Error-Handler",
+  "nodes": [
+    {
+      "id": "n-27cda3d35455",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n-e3368e9ae8ff",
+      "name": "Release Lock and Cleanup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst errData = $input.item.json;\nconst ts = new Date().toISOString();\nconst batchId = errData.execution?.id || 'unknown';\nlet sourcePath = '';\n\n// Search common locations for the source path\nconst searchPaths = [\n  errData._source_path,\n  errData.json?._source_path,\n  errData.inputData?._source_path,\n  errData.error?.context?._source_path\n];\nfor (const p of searchPaths) {\n  if (p && typeof p === 'string') { sourcePath = p; break; }\n}\n\nlet lockReleased = false;\nconst lockPath = sourcePath ? sourcePath.replace(/\\.processing$/, '.lock') : '';\n\n// Release .lock file (atomic lock)\nif (lockPath && _fs.existsSync(lockPath)) {\n  try { _fs.unlinkSync(lockPath); lockReleased = true; } catch (e) {\n    console.warn('[ErrorHandler] Cannot remove lock file:', e.message);\n  }\n}\n\n// Move .processing file to _failed\nif (sourcePath && _fs.existsSync(sourcePath) && sourcePath.endsWith('.processing')) {\n  try {\n    const failDir = _path.join(cfg.vaultPath, '00_Inbox', '_failed');\n    _fs.mkdirSync(failDir, { recursive: true });\n    const base = _path.basename(sourcePath).replace(/\\.processing$/, '');\n    const dest = _path.join(failDir, ts.replace(/[:.]/g, '-').substring(0, 19) + '_' + base);\n    _fs.renameSync(sourcePath, dest);\n    lockReleased = true;\n  } catch (e) { console.warn('[ErrorHandler] Cannot move failed file:', e.message); }\n}\n\nconst errorMessage = errData.error?.message || errData.message || 'Unknown error';\nconst errorNode = errData.error?.node?.name || 'Unknown node';\nslog(cfg.vaultPath, 'ErrorHandler-ReleaseLock', 'error', errorMessage, batchId, {\n  node: errorNode, lockReleased, sourcePath\n});\n\nreturn { json: { ...errData, _lock_released: lockReleased, _error_ts: ts } };\n"
+      }
+    },
+    {
+      "id": "n-9c180aa0e392",
+      "name": "Log Error to Vault",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        750,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst data = $input.item.json;\nconst ts = data._error_ts || new Date().toISOString();\nconst batchId = data.execution?.id || 'unknown';\nconst errorMsg = data.error?.message || data.message || 'Unknown error';\nconst errorNode = data.error?.node?.name || 'Unknown node';\nconst workflowName = data.workflow?.name || 'Unknown workflow';\n\nconst logDir = _path.join(cfg.vaultPath, '04_Meta');\n_fs.mkdirSync(logDir, { recursive: true });\n\n// JSONL structured log\nconst entry = JSON.stringify({\n  ts, batchId, workflowName, errorNode, errorMsg,\n  lockReleased: data._lock_released || false\n});\n_fs.appendFileSync(_path.join(logDir, 'error_log.jsonl'), entry + '\\n', 'utf8');\n\n// Human-readable error note\nconst safeTs = ts.replace(/[:.]/g, '-').substring(0, 19);\nconst notePath = _path.join(logDir, 'errors', `ERROR_${safeTs}.md`);\n_fs.mkdirSync(_path.dirname(notePath), { recursive: true });\nconst noteContent = `---\ntitle: \"ERROR: ${workflowName} @ ${ts}\"\ndate: \"${ts.split('T')[0]}\"\ntags: [error, workflow-failure]\nbatch_id: \"${batchId}\"\n---\n\n# Error: ${workflowName}\n\n| Field | Value |\n|-------|-------|\n| Time | ${ts} |\n| Workflow | ${workflowName} |\n| Node | ${errorNode} |\n| Batch | \\`${batchId}\\` |\n\n## Error Message\n\n\\`\\`\\`\n${errorMsg}\n\\`\\`\\`\n`;\n_fs.writeFileSync(notePath, noteContent, 'utf8');\nslog(cfg.vaultPath, 'ErrorHandler-LogError', 'error', errorMsg, batchId);\nreturn { json: { status: 'error_logged', errorMsg, batchId } };\n"
+      }
+    },
+    {
+      "id": "n-dd413886dc4e",
+      "name": "Send Webhook Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JANITOR_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ event: 'rce_error', message: $json.errorMsg, batchId: $json.batchId, ts: new Date().toISOString() }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Release Lock and Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release Lock and Cleanup": {
+      "main": [
+        [
+          {
+            "node": "Log Error to Vault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Error to Vault": {
+      "main": [
+        [
+          {
+            "node": "Send Webhook Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "",
+    "timezone": "Asia/Kolkata"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "versionId": "a770558a-a090-4c7e-b632-e325ea239901"
+}

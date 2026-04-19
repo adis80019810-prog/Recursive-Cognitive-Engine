@@ -1,0 +1,452 @@
+{
+  "name": "RCE-01-Ingestion",
+  "nodes": [
+    {
+      "id": "n-9ae7d199f064",
+      "name": "Inbox File Trigger",
+      "type": "n8n-nodes-base.localFileTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "path": "={{ $env.OBSIDIAN_VAULT_PATH }}/00_Inbox",
+        "events": [
+          "add"
+        ],
+        "includeSubdirectories": false,
+        "options": {
+          "awaitWriteFinish": true
+        }
+      }
+    },
+    {
+      "id": "n-cc3a78d6c914",
+      "name": "Acquire Lock (Atomic)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst crypto = require('crypto');\nconst cfg = getConfig();\nconst { vaultPath } = cfg;\nconst inputData = $input.item.json;\nconst rawPath = inputData.path;\n\nif (!rawPath || typeof rawPath !== 'string')\n  throw new Error('[Ingestion-AcquireLock] Invalid or missing file path');\n\n// Confine to 00_Inbox only (allowlist-based, not regex)\nconst inboxDir = _path.resolve(vaultPath, '00_Inbox');\nconst resolvedFile = _path.resolve(rawPath);\nif (!resolvedFile.startsWith(inboxDir + _path.sep) && resolvedFile !== inboxDir)\n  throw new Error('[Ingestion-AcquireLock] SECURITY: file path escapes inbox: ' + rawPath);\n\n// Verify file exists\nlet fileStat;\ntry { fileStat = _fs.statSync(resolvedFile); }\ncatch (e) { throw new Error('[Ingestion-AcquireLock] File inaccessible: ' + rawPath + ' — ' + e.message); }\n\nconst batchId = crypto.createHash('sha256')\n  .update(resolvedFile + fileStat.mtime.toISOString())\n  .digest('hex').substring(0, 16);\n\n// ── Idempotency check via JSON index ──────────────────────────────────────\nconst indexPath = _path.join(vaultPath, '04_Meta', 'processed_index.json');\nlet processedIndex = {};\ntry {\n  if (_fs.existsSync(indexPath))\n    processedIndex = JSON.parse(_fs.readFileSync(indexPath, 'utf8'));\n} catch (_) {}\n\nif (processedIndex[batchId]) {\n  slog(vaultPath, 'Ingestion-AcquireLock', 'info', 'Already processed — skipping', batchId);\n  return { json: { ...inputData, _idempotency_skip: true, _batch_id: batchId } };\n}\n\n// ── Atomic lock via O_EXCL (exclusive file creation — POSIX atomic) ────────\nconst lockPath = resolvedFile + '.lock';\nlet lockFd;\ntry {\n  lockFd = _fs.openSync(lockPath, 'wx'); // O_CREAT | O_EXCL\n  _fs.writeSync(lockFd, JSON.stringify({\n    pid: process.pid,\n    ts: new Date().toISOString(),\n    batchId\n  }));\n  _fs.closeSync(lockFd);\n} catch (lockErr) {\n  if (lockErr.code === 'EEXIST') {\n    // Lock exists — check if stale (> 30 minutes)\n    try {\n      const existing = JSON.parse(_fs.readFileSync(lockPath, 'utf8'));\n      const ageMs = Date.now() - new Date(existing.ts).getTime();\n      if (ageMs > 30 * 60 * 1000) {\n        // Stale lock — remove and re-acquire\n        _fs.unlinkSync(lockPath);\n        lockFd = _fs.openSync(lockPath, 'wx');\n        _fs.writeSync(lockFd, JSON.stringify({ pid: process.pid, ts: new Date().toISOString(), batchId, staleCleaned: true }));\n        _fs.closeSync(lockFd);\n        slog(vaultPath, 'Ingestion-AcquireLock', 'warn', 'Stale lock cleaned and re-acquired', batchId);\n      } else {\n        throw new Error('[Ingestion-AcquireLock] File locked by another process (age: ' + Math.round(ageMs / 1000) + 's)');\n      }\n    } catch (readErr) {\n      if (readErr.message.startsWith('[Ingestion')) throw readErr;\n      // Corrupt lock file — treat as stale\n      _fs.unlinkSync(lockPath);\n      lockFd = _fs.openSync(lockPath, 'wx');\n      _fs.writeSync(lockFd, JSON.stringify({ pid: process.pid, ts: new Date().toISOString(), batchId }));\n      _fs.closeSync(lockFd);\n    }\n  } else {\n    throw new Error('[Ingestion-AcquireLock] Cannot create lock: ' + lockErr.message);\n  }\n}\n\n// Rename to .processing (visual marker for operators)\nconst processingPath = resolvedFile + '.processing';\n_fs.renameSync(resolvedFile, processingPath);\n\nslog(vaultPath, 'Ingestion-AcquireLock', 'info', 'Lock acquired', batchId, { file: rawPath });\nreturn { json: { ...inputData, path: processingPath, _source_path: processingPath, _batch_id: batchId, _lock_path: lockPath } };\n"
+      }
+    },
+    {
+      "id": "n-f36e2433c871",
+      "name": "MIME Pre-Validator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst data = $input.item.json;\nif (data._idempotency_skip) return { json: data };\n\nconst filePath = data.path;\nif (!filePath || typeof filePath !== 'string') throw new Error('[Ingestion-MimeValidator] No file path');\n\nconst cleanExt = _path.extname(filePath.replace(/\\.processing$/, '')).toLowerCase();\nconst SUPPORTED = new Set(['.pdf', '.txt', '.md', '.markdown', '.docx', '.html', '.htm', '.epub']);\n\n// Magic-byte verification (prevents extension spoofing attacks)\nlet mimeOk = true, detectedMime = 'unknown';\ntry {\n  const fd = _fs.openSync(filePath, 'r');\n  const magic = Buffer.alloc(8);\n  _fs.readSync(fd, magic, 0, 8, 0);\n  _fs.closeSync(fd);\n  const hex = magic.toString('hex');\n\n  if (cleanExt === '.pdf') {\n    mimeOk = hex.startsWith('25504446'); // %PDF\n    detectedMime = mimeOk ? 'application/pdf' : 'MISMATCH';\n    if (!mimeOk) throw new Error('[Ingestion-MimeValidator] SECURITY: .pdf extension but magic bytes = 0x' + hex.substring(0, 8));\n  } else if (cleanExt === '.docx' || cleanExt === '.epub') {\n    mimeOk = hex.startsWith('504b0304'); // PK ZIP header\n    detectedMime = mimeOk ? 'application/zip' : 'MISMATCH';\n    if (!mimeOk) throw new Error('[Ingestion-MimeValidator] SECURITY: ' + cleanExt + ' magic mismatch = 0x' + hex.substring(0, 8));\n  } else {\n    detectedMime = 'text/' + (cleanExt.replace('.', '') || 'plain');\n  }\n} catch (e) {\n  if (e.message.startsWith('[Ingestion')) throw e;\n  throw new Error('[Ingestion-MimeValidator] Cannot read file magic: ' + e.message);\n}\n\nreturn { json: { ...data, _mime: detectedMime, _ext: cleanExt, _supported: SUPPORTED.has(cleanExt) } };\n"
+      }
+    },
+    {
+      "id": "n-f3ad0dd047b7",
+      "name": "Route by File Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        820,
+        300
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "rules": [
+            {
+              "conditions": {
+                "options": {
+                  "leftValue": "",
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json._ext }}",
+                    "rightValue": ".pdf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "pdf"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "leftValue": "",
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json._ext }}",
+                    "rightValue": ".docx",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "docx"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "leftValue": "",
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "or",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json._ext }}",
+                    "rightValue": ".html",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "leftValue": "={{ $json._ext }}",
+                    "rightValue": ".htm",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "html"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "leftValue": "",
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json._supported }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "text"
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      }
+    },
+    {
+      "id": "n-418ed8bc9c42",
+      "name": "Read Binary (PDF)",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        1060,
+        180
+      ],
+      "parameters": {
+        "filePath": "={{ $json.path }}"
+      }
+    },
+    {
+      "id": "n-5adfac70476f",
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        1060,
+        180
+      ],
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      }
+    },
+    {
+      "id": "n-d25b8415be78",
+      "name": "Normalize PDF Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        180
+      ],
+      "parameters": {
+        "jsCode": "\nconst data = $input.item.json;\nconst _path = require('path');\nconst rawPath = data.path || data.filePath || '';\nreturn { json: {\n  ...data,\n  path: rawPath,\n  filename: _path.basename(rawPath.replace(/\\.processing$/, ''), _path.extname(rawPath.replace(/\\.processing$/, ''))),\n  text: data.text || data.extractedText || data.content || '',\n  source: 'pdf'\n}};\n"
+      }
+    },
+    {
+      "id": "n-7316ae9ce68c",
+      "name": "Read DOCX / EPUB",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst _fs = require('fs'), _path = require('path');\nconst data = $input.item.json;\nconst filePath = data.path || '';\nlet text = '';\ntry {\n  const AdmZip = require('adm-zip');\n  const zip = new AdmZip(filePath);\n  const ext = _path.extname(filePath.replace(/\\.processing$/, '')).toLowerCase();\n  const xmlFile = ext === '.epub' ? 'OEBPS/content.opf' : 'word/document.xml';\n  const docXml = zip.readAsText(xmlFile);\n  text = docXml\n    .replace(/<w:br[^>]*>/gi, '\\n').replace(/<w:p[\\s>]/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#x27;/g, \"'\")\n    .replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();\n} catch (e) {\n  console.warn('[Ingestion-ReadDocx] adm-zip failed (' + e.message + '), using text fallback');\n  try {\n    const buf = _fs.readFileSync(filePath);\n    text = buf.toString('utf8').replace(/[\\x00-\\x08\\x0B\\x0E-\\x1F\\x7F-\\x9F]/g, ' ')\n      .replace(/\\s{3,}/g, '\\n\\n').trim();\n  } catch (fe) { throw new Error('[Ingestion-ReadDocx] All read methods failed: ' + fe.message); }\n}\nconst cleanPath = filePath.replace(/\\.processing$/, '');\nreturn { json: { ...data, filename: _path.basename(cleanPath, _path.extname(cleanPath)), text, source: 'docx' }};\n"
+      }
+    },
+    {
+      "id": "n-56230a3fe857",
+      "name": "Read Text File",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        420
+      ],
+      "parameters": {
+        "jsCode": "\nconst _fs = require('fs'), _path = require('path');\nconst data = $input.item.json;\nconst filePath = data.path;\nlet content;\ntry { content = _fs.readFileSync(filePath, 'utf8'); }\ncatch (err) { throw new Error('[Ingestion-ReadText] Cannot read ' + filePath + ': ' + err.message); }\nconst cleanPath = filePath.replace(/\\.processing$/, '');\nreturn { json: {\n  ...data,\n  filename: _path.basename(cleanPath, _path.extname(cleanPath)),\n  text: content,\n  source: 'text'\n}};\n"
+      }
+    },
+    {
+      "id": "n-7872eb2eeb51",
+      "name": "Normalize HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        540
+      ],
+      "parameters": {
+        "jsCode": "\nconst _fs = require('fs'), _path = require('path');\nconst data = $input.item.json;\nconst filePath = data.path;\nlet raw;\ntry { raw = _fs.readFileSync(filePath, 'utf8'); }\ncatch (err) { throw new Error('[Ingestion-ReadHtml] ' + err.message); }\nconst text = raw\n  .replace(/<script[\\s\\S]*?<\\/script>/gi, '')\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/&nbsp;/g, ' ').replace(/\\s{2,}/g, ' ').trim();\nconst cleanPath = filePath.replace(/\\.processing$/, '');\nreturn { json: { ...data, filename: _path.basename(cleanPath, _path.extname(cleanPath)), text, source: 'html' }};\n"
+      }
+    },
+    {
+      "id": "n-b40f20609f6c",
+      "name": "Handle Unsupported File",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        660
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst data = $input.item.json;\nconst filePath = data.path || '';\nconst lockPath = data._lock_path || '';\n\n// Move to _unsupported quarantine\nif (filePath && _fs.existsSync(filePath)) {\n  try {\n    const skipDir = _path.join(cfg.vaultPath, '00_Inbox', '_unsupported');\n    _fs.mkdirSync(skipDir, { recursive: true });\n    const base = _path.basename(filePath).replace(/\\.processing$/, '');\n    _fs.renameSync(filePath, _path.join(skipDir, base));\n  } catch (e) { console.warn('[Ingestion-Unsupported] Cannot quarantine:', e.message); }\n}\n\n// Release lock\nif (lockPath && _fs.existsSync(lockPath)) {\n  try { _fs.unlinkSync(lockPath); } catch (_) {}\n}\n\nconst logPath = _path.join(cfg.vaultPath, '00_Inbox', '_errors.log');\n_fs.appendFileSync(logPath, '[' + new Date().toISOString() + '] UNSUPPORTED: ' + filePath + '\\n');\nslog(cfg.vaultPath, 'Ingestion-Unsupported', 'warn', 'Unsupported file type', data._batch_id || 'unknown');\nreturn { json: { status: 'unsupported', path: filePath } };\n"
+      }
+    },
+    {
+      "id": "n-fa2691647ad6",
+      "name": "Token Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        320
+      ],
+      "parameters": {
+        "jsCode": "// ── RCE Shared Utilities v3 (inlined – no eval()) ─────────────────────────\nconst _fs = require('fs'), _path = require('path');\n\nfunction sanitizeFilename(raw) {\n  if (!raw || typeof raw !== 'string') throw new Error('sanitizeFilename: invalid input');\n  const base = _path.basename(raw.replace(/\\\\/g, '/'));\n  const out = base.replace(/[<>:\"\\/\\\\|?*\\x00-\\x1f]/g, '-')\n    .replace(/\\.{2,}/g, '-').replace(/-{2,}/g, '-').trim();\n  if (!out || out === '-' || out.replace(/\\.md$/, '').length === 0)\n    throw new Error('sanitizeFilename: unusable for \"' + raw + '\"');\n  return out;\n}\n\nfunction validateVaultPath(targetPath, vaultRoot) {\n  const res = _path.resolve(targetPath), root = _path.resolve(vaultRoot);\n  if (!res.startsWith(root + _path.sep) && res !== root)\n    throw new Error('SECURITY: path traversal blocked: \"' + targetPath + '\"');\n  return res;\n}\n\nfunction safeTruncate(str, maxBytes) {\n  if (typeof str !== 'string') return '';\n  if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;\n  let lo = 0, hi = str.length;\n  while (lo < hi) {\n    const mid = Math.ceil((lo + hi) / 2);\n    Buffer.byteLength(str.slice(0, mid), 'utf8') <= maxBytes ? (lo = mid) : (hi = mid - 1);\n  }\n  return str.slice(0, lo);\n}\n\nfunction slog(vaultPath, node, level, message, batchId, metrics) {\n  try {\n    const e = JSON.stringify({\n      ts: new Date().toISOString(), node, level,\n      batchId: batchId || 'unknown', message,\n      ...(metrics ? { metrics } : {})\n    });\n    _fs.appendFileSync(_path.join(vaultPath, '04_Meta', 'structured.log'), e + '\\n');\n  } catch (_) {}\n}\n\nfunction getConfig() {\n  const e = process.env;\n  if (!e.OBSIDIAN_VAULT_PATH) throw new Error('OBSIDIAN_VAULT_PATH is not set');\n  if (!e.ANTHROPIC_API_KEY || !e.ANTHROPIC_API_KEY.startsWith('sk-') || e.ANTHROPIC_API_KEY.length < 20)\n    throw new Error('ANTHROPIC_API_KEY is missing or invalid');\n  const VM = ['claude-sonnet-4-6', 'claude-opus-4', 'claude-haiku-3-5'];\n  return {\n    vaultPath:      e.OBSIDIAN_VAULT_PATH,\n    apiKey:         e.ANTHROPIC_API_KEY,\n    model:          VM.includes(e.CLAUDE_MODEL) ? e.CLAUDE_MODEL : 'claude-sonnet-4-6',\n    maxChars:       Math.min(Math.max(parseInt(e.SOURCE_TEXT_MAX_CHARS) || 60000, 1000), 200000),\n    maxTokens:      Math.min(Math.max(parseInt(e.CLAUDE_MAX_TOKENS) || 8192, 1000), 128000),\n    maxRetries:     Math.min(Math.max(parseInt(e.CLAUDE_MAX_RETRIES) || 4, 1), 10),\n    cacheMaxAge:    Math.min(Math.max(parseInt(e.SNAPSHOT_CACHE_MINUTES) || 30, 1), 1440) * 60000,\n    maxVersions:    Math.min(Math.max(parseInt(e.MAX_NOTE_VERSIONS) || 5, 1), 20),\n    councilEnabled: (e.COUNCIL_DEBATE_ENABLED || 'false').toLowerCase() === 'true',\n    humanReview:    (e.HUMAN_REVIEW_ENABLED || 'false').toLowerCase() === 'true',\n    janitorWebhook: e.JANITOR_WEBHOOK_URL || ''\n  };\n}\n// ── End Shared Utilities ───────────────────────────────────────────────────\n\nconst cfg = getConfig();\nconst { vaultPath, maxChars } = cfg;\nconst HARD_CEILING_BYTES = 180000 * 4; // 720 KB hard limit\nconst data = $input.item.json;\nconst batchId = data._batch_id || 'unknown';\nconst rawText = data.text || data.extractedText || data.content || '';\nconst rawBytes = Buffer.byteLength(rawText, 'utf8');\nlet text = rawText, truncated = false, truncationNote = '';\n\nif (rawBytes > HARD_CEILING_BYTES) {\n  text = safeTruncate(rawText, HARD_CEILING_BYTES);\n  truncated = true;\n  truncationNote = 'Truncated: ' + rawBytes + ' → ' + HARD_CEILING_BYTES + ' bytes (hard ceiling)';\n} else if (rawBytes > maxChars * 4) {\n  text = safeTruncate(rawText, maxChars * 4);\n  truncated = true;\n  truncationNote = 'Truncated: ' + rawBytes + ' → ' + (maxChars * 4) + ' bytes (SOURCE_TEXT_MAX_CHARS)';\n}\n\nif (truncated) {\n  console.warn('[Ingestion-TokenGuard]', truncationNote);\n  slog(vaultPath, 'Ingestion-TokenGuard', 'warn', truncationNote, batchId, {\n    original_bytes: rawBytes, source: data.filename || 'unknown'\n  });\n}\n\nreturn { json: { ...data, text, source_bytes_raw: rawBytes, source_truncated: truncated, truncation_note: truncationNote || null }};\n"
+      }
+    },
+    {
+      "id": "n-611652303e80",
+      "name": "Call: RCE-02-Decompose",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1780,
+        320
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "RCE-02-Decompose"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Inbox File Trigger": {
+      "main": [
+        [
+          {
+            "node": "Acquire Lock (Atomic)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acquire Lock (Atomic)": {
+      "main": [
+        [
+          {
+            "node": "MIME Pre-Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MIME Pre-Validator": {
+      "main": [
+        [
+          {
+            "node": "Route by File Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by File Type": {
+      "main": [
+        [
+          {
+            "node": "Read Binary (PDF)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read DOCX / EPUB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Normalize HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Text File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Unsupported File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Binary (PDF)": {
+      "main": [
+        [
+          {
+            "node": "Extract PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Normalize PDF Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize PDF Output": {
+      "main": [
+        [
+          {
+            "node": "Token Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read DOCX / EPUB": {
+      "main": [
+        [
+          {
+            "node": "Token Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Text File": {
+      "main": [
+        [
+          {
+            "node": "Token Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize HTML": {
+      "main": [
+        [
+          {
+            "node": "Token Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Token Guard": {
+      "main": [
+        [
+          {
+            "node": "Call: RCE-02-Decompose",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "RCE-00-Error-Handler",
+    "timezone": "Asia/Kolkata"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "versionId": "49a989f9-d507-4d68-988b-fda405f28bae"
+}
