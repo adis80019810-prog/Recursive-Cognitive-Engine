@@ -2,9 +2,7 @@
 
 > **Turn messy documents into a clean, organized second brain—automatically.**
 
-Imagine you have a pile of books, PDFs, and articles you want to learn from. Normally, you'd spend hours reading, highlighting, and typing up notes. **RCE does that work for you while you sleep.**
-
-You drop a file into a folder. The AI reads it, figures out the key ideas, and writes beautiful, linked notes directly into your Obsidian knowledge base. You just review and approve. That's it.
+Drop a PDF, Word doc, EPUB, or text file into a folder. AI reads it, finds the key ideas, checks for duplicates, and writes beautiful linked notes into your Obsidian vault. You review and approve before anything goes live. A weekly janitor cleans up the mess. **Everything is self‑healing.**
 
 ---
 
@@ -12,94 +10,144 @@ You drop a file into a folder. The AI reads it, figures out the key ideas, and w
 
 | The Old Way | With RCE |
 | :--- | :--- |
-| Read a 300‑page book and spend 6 hours making notes. | Drop the PDF in a folder. Go have dinner. Notes are waiting for you. |
-| Worry that the AI will make up facts or break your files. | RCE has **safety checks** built in. Nothing gets written without your approval. |
-| End up with a messy folder full of duplicate notes. | RCE **checks your existing notes** and only adds new, relevant information. |
-| Accidentally delete something important. | RCE keeps **automatic backups** of every version. |
+| Spend hours reading and taking notes. | Drop the file. Walk away. Notes are waiting. |
+| Worry the AI will hallucinate or corrupt files. | Human review gate + atomic writes prevent data loss. |
+| End up with duplicate or conflicting notes. | Fuzzy deduplication checks your entire vault first. |
+| Manually clean up temporary files and old drafts. | A weekly janitor prunes and recovers automatically. |
 
 ---
 
 ## 🎬 How It Works (In Plain English)
 
-1. **You drop a file** (PDF, Word document, text file) into a special `00_Inbox` folder.
-2. **RCE locks the file** so it doesn't get messed up while being read.
-3. **The AI reads the entire document** and understands what's important.
-4. **RCE looks at your existing notes** to avoid creating duplicates.
-5. **The AI proposes 8‑12 new notes** and puts them in a **"Pending Review"** area.
-6. **You get a notification** (optional) and can approve or reject the batch.
-7. **Approved notes are written safely** to your Obsidian vault.
-8. **The original file is archived** so you never lose the source material.
+1. **You drop a file** (PDF, DOCX, EPUB, HTML, TXT, MD) into `00_Inbox`.
+2. **RCE locks the file** so nothing else touches it while processing.
+3. **The file type is verified** by reading its actual bytes—not just trusting the extension.
+4. **The AI (Claude) reads the entire document** and extracts core ideas.
+5. **RCE scans your existing notes** to avoid creating duplicates.
+6. **A Council of Advisors debates the quality** of the AI's summary (see below).
+7. **The proposed notes are staged** for your review.
+8. **You approve or reject** via webhook (optional; can auto‑approve).
+9. **Approved notes are written safely** using atomic operations (no partial writes).
+10. **The original file is archived** with sidecar metadata for full auditability.
+11. **Every Sunday at 3 AM**, a janitor cleans up stale files, frees orphaned locks, and rotates logs.
 
-Every Sunday night, a **digital janitor** wakes up, cleans out temporary files, and makes sure everything is running smoothly.
+---
 
 ## 🏛️ The Council of Advisors (Unique Feature)
 
-Before any note is finalized, the system convenes a **council of four distinct advisors** to debate the quality of the ideas. Each advisor brings a specific lens:
+Before notes are finalized, a **council of four distinct advisors** debates the AI's summary. Each brings a specific worldview:
 
 | Advisor | Perspective | What They Challenge |
 | :--- | :--- | :--- |
-| **Kautilya (Chanakya)** | Ancient Indian strategist, author of the *Arthashastra* | Power dynamics, pragmatic governance, realpolitik. *"Is this actually wise in the real world?"* |
-| **Richard Feynman** | Nobel physicist and legendary educator | Technical clarity. *"Can you explain this simply? Where does it break under scrutiny?"* |
-| **Jeff Bezos** | Founder of Amazon | Scalability and ROI. *"Is this worth building? Will it scale beyond a hobby?"* |
-| **Daniel Kahneman** | Nobel economist, author of *Thinking, Fast and Slow* | Cognitive biases. *"What mental shortcuts are you taking? What are you not seeing?"* |
+| **Kautilya (Chanakya)** | Ancient strategist, *Arthashastra* | Power dynamics, pragmatism, realpolitik |
+| **Richard Feynman** | Nobel physicist and educator | Technical clarity and explanatory depth |
+| **Jeff Bezos** | Founder of Amazon | Scalability, ROI, and build‑worthiness |
+| **Daniel Kahneman** | Nobel economist, *Thinking, Fast and Slow* | Cognitive biases and blind spots |
 
 **How the debate works:**
-1. **Critic Pass:** Claude acts as a devil's advocate and critiques the AI‑generated summary.
-2. **Synthesis Pass:** Claude synthesizes the original summary with the critique into a balanced, nuanced assessment.
-3. **Permanent Record:** The full debate is saved to `02_Council_Debates/` as a permanent audit trail of the thinking behind each batch of notes.
+1. **Critic Pass:** Claude critiques the original summary as a devil's advocate.
+2. **Synthesis Pass:** Claude synthesizes the original summary with the critique into a balanced assessment.
+3. **Permanent Record:** The full debate is saved to `02_Council_Debates/`.
 
-This feature ensures the AI doesn't just summarize—it **questions itself** from multiple worldviews before you ever see the output.
----
-
-## 🛡️ Why This Is Different From "Just Using ChatGPT"
-
-Most AI automations are fragile. If the internet cuts out mid‑write, your file gets corrupted. If the AI returns gibberish, it still gets saved.
-
-**RCE was built with seatbelts and airbags:**
-
-- ✅ **Human Review Gate:** You see exactly what the AI wants to write *before* it touches your vault.
-- ✅ **Self‑Healing:** If something goes wrong (disk full, power outage), RCE cleans up after itself and alerts you.
-- ✅ **Atomic Writes:** Files are written in a way that prevents corruption—even if your computer crashes mid‑save.
-- ✅ **Version History:** Every time a note is updated, the old version is saved. You can always go back.
+This forces the AI to question itself from multiple worldviews *before* you ever see the output.
 
 ---
 
-## 📁 The Vault Structure (What You Get)
+## 🔧 Technical Features (For Engineers)
 
-After processing, your Obsidian vault will look like this:
+This is not a simple "AI wrapper." It's a production‑grade automation with defense‑in‑depth.
+
+**Reliability & Safety**
+- POSIX atomic file locking (`O_EXCL`) – prevents race conditions
+- Stale lock detection and auto‑recovery (30‑minute TTL)
+- Atomic writes via temp file + rename – no partial writes
+- Self‑healing error recovery – dedicated workflow releases locks and quarantines failed files
+- Idempotent processing – `processed_index.json` prevents duplicate runs
+
+**Security & Validation**
+- Magic‑byte MIME validation – verifies PDF/DOCX/EPUB, not just extensions
+- Path traversal hardening – `validateVaultPath()` blocks directory escapes
+- Unsupported file quarantine – moves unknown files to `_unsupported/`
+
+**AI & Content Quality**
+- Byte‑level token truncation with binary search – prevents API payload errors
+- SHA‑256 content hashing – skips exact duplicate writes
+- Fuzzy semantic deduplication – 75% word‑overlap threshold
+- Two‑pass Council critique – critic → synthesis
+- Persona‑based adversarial review (Kautilya, Feynman, Bezos, Kahneman)
+
+**Observability & Maintenance**
+- Structured JSON logging (`structured.log`) – machine‑readable audit trail
+- Sidecar metadata for archived sources (`.meta.json`)
+- Weekly janitor: prunes stale staging files, failed files, orphaned locks, abandoned `.processing` files
+- Log rotation at 10 MB
+- Health checks on vault directories
+- Environment variable validation on startup
+
+**Supported Formats**
+- PDF (native extraction)
+- DOCX (extracts from `word/document.xml`)
+- EPUB (extracts from `OEBPS/content.opf`)
+- HTML (strips scripts/styles, decodes entities)
+- Plain text / Markdown
+
+---
+
+## 📁 Vault Structure (What You Get)
 Your Vault/
 ├── 00_Inbox/ ← Drop files here
-├── 01_Wiki_Nodes/ ← Your beautiful, AI‑generated notes
-├── 02_Council_Debates/← AI debates the quality of the ideas
-├── 03_Lesson_Cemetery/← Ideas that were refuted or disproven
-├── 04_Meta/ ← Logs and staging previews
-├── 05_Sources/ ← Archived original documents
-└── 06_Visuals/ ← Mermaid diagrams of complex concepts
+│ ├── _failed/ ← Files that errored out
+│ ├── _rejected/ ← Batches you rejected
+│ ├── _recovered/ ← Abandoned .processing files rescued by Janitor
+│ └── _unsupported/ ← Unsupported file types
+├── 01_Wiki_Nodes/ ← AI‑generated atomic notes
+├── 02_Council_Debates/ ← Permanent records of advisor debates
+├── 03_Lesson_Cemetery/ ← Refuted claims and ideas
+├── 04_Meta/
+│ ├── _staging/ ← Pending review previews
+│ ├── completed/ ← Completion summaries
+│ ├── errors/ ← Human‑readable error notes
+│ ├── .snapshot_cache.json
+│ ├── processed_index.json
+│ ├── processing_log.jsonl
+│ ├── structured.log ← JSON Lines audit log
+│ └── error_log.jsonl
+├── 05_Sources/ ← Archived original files + .meta.json sidecars
+└── 06_Visuals/ ← Mermaid diagrams (if generated)
 ---
 
-## 🧰 What's Inside This Repository?
+## 🧰 Workflow Architecture (Modular)
 
-This repository contains **six modular n8n workflows** that work together as a complete system.
+The system is split into **six independent n8n workflows** for resilience and maintainability.
 
-| Workflow | What It Does |
+| Workflow | File | Responsibility |
+| :--- | :--- | :--- |
+| **Error Handler** | `workflows/00-error-handler/` | Global catch‑all; releases locks, quarantines files, logs errors |
+| **Ingestion** | `workflows/01-ingestion/` | File watching, atomic locking, MIME validation, text extraction |
+| **Decompose** | `workflows/02-decompose/` | Vault snapshot, Claude API call, response parsing, staging preview, human review gate |
+| **Write Vault** | `workflows/03-write-vault/` | Splits notes, atomic writes, versioning, fuzzy dedup, archival, lock release |
+| **Council** | `workflows/04-council/` | Two‑pass critic + synthesis, Mermaid visuals, Lesson Cemetery, 24h experiments |
+| **Janitor** | `workflows/janitor/` | Weekly health check, prunes stale files, frees orphaned locks, rotates logs |
+
+> ⚠️ **Disclaimer:** This repository is a **reference architecture portfolio piece**. It is not a one‑click install tool. It demonstrates advanced patterns for building reliable, human‑in‑the‑loop AI systems using n8n.
+
+---
+
+## 🔑 Environment Variables Required
+
+| Variable | Description |
 | :--- | :--- |
-| **Ingestion** | Watches the inbox, reads files, and extracts text. |
-| **Decompose** | Sends text to Claude AI and asks for notes. |
-| **Write Vault** | Safely writes the approved notes to your Obsidian vault. |
-| **Council** | Runs a second AI pass to critique and refine the ideas. |
-| **Error Handler** | Catches any problems and prevents file corruption. |
-| **Janitor** | Weekly maintenance—cleans up old files and logs. |
-
-> ⚠️ **Disclaimer:** This repository is a **portfolio reference architecture**. It's not a one‑click install tool. It demonstrates how to build reliable, human‑in‑the‑loop AI systems using n8n.
-
----
-
-## 👤 Who Is This For?
-
-- **Knowledge workers** who want to spend less time organizing and more time thinking.
-- **Students and researchers** drowning in PDFs and articles.
-- **Business professionals** who need to synthesize information from multiple sources.
-- **AI Automation Engineers** looking for a production‑grade reference implementation.
+| `OBSIDIAN_VAULT_PATH` | Absolute path to your Obsidian vault root |
+| `ANTHROPIC_API_KEY` | Claude API key (must start with `sk-`) |
+| `CLAUDE_MODEL` | Model name (e.g., `claude-sonnet-4-6`, `claude-opus-4-7`) |
+| `SOURCE_TEXT_MAX_CHARS` | Max characters to send to Claude (default: 60000) |
+| `CLAUDE_MAX_TOKENS` | Max tokens for Claude response (default: 8192) |
+| `CLAUDE_MAX_RETRIES` | Number of retries on rate limit (default: 4) |
+| `SNAPSHOT_CACHE_MINUTES` | How long to cache vault snapshot (default: 30) |
+| `MAX_NOTE_VERSIONS` | Number of old versions to keep (default: 5) |
+| `HUMAN_REVIEW_ENABLED` | `true` / `false` – whether to wait for webhook approval |
+| `COUNCIL_DEBATE_ENABLED` | `true` / `false` – whether to run the Council workflow |
+| `JANITOR_WEBHOOK_URL` | (Optional) URL for completion and error alerts |
 
 ---
 
@@ -109,10 +157,10 @@ This repository contains **six modular n8n workflows** that work together as a c
 A: No. Once set up, you just drag and drop files. Setup requires basic familiarity with n8n and Obsidian.
 
 **Q: What does it cost to run?**  
-A: You pay for the Claude API calls (approximately $0.10–$0.50 per book, depending on length). n8n can be run for free on your own computer.
+A: You pay for Claude API calls (approx. $0.10–$0.50 per book, depending on length). n8n can be run for free locally.
 
 **Q: Can I trust the AI not to make things up?**  
-A: The human review gate ensures you see everything before it's saved. You can edit, reject, or approve each batch.
+A: The human review gate ensures you see everything before it's saved. The Council of Advisors also critiques the output before you even see it.
 
 ---
 
