@@ -51,7 +51,7 @@ All behaviour is controlled via environment variables:
 |----------|-------------|---------|
 | `OBSIDIAN_VAULT_PATH` | Absolute path to your Obsidian vault | *Required* |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key | *Required* |
-| `CLAUDE_MODEL` | Model to use (e.g., `claude-3-5-sonnet-20241022`) | `claude-sonnet-4-6` (⚠️ set this) |
+| `CLAUDE_MODEL` | Model to use (recommended: `claude-opus-4-7` for decompose, falls back to `claude-sonnet-4-6` for council) | `claude-opus-4-7` ||
 | `MASTER_ARCHITECT_PROMPT_PATH` | Path to file containing the decomposition prompt | Falls back to inline minimal prompt |
 | `HUMAN_REVIEW_ENABLED` | `true` to pause for manual approval | `false` |
 | `SNAPSHOT_CACHE_MINUTES` | How long to cache vault snapshot | `5` |
@@ -78,6 +78,18 @@ Council Debate (if summary exists) Archive Source
 Write Council Note Completion Notifier
 A **weekly schedule** triggers the Janitor: scans for stale/orphan notes and runs local TF‑IDF duplicate detection.
 
+## The Council of Advisors
+
+RCE includes a unique "Council Debate" feature where four distinct personas critique the synthesis:
+
+| Persona | Role |
+|---------|------|
+| **Richard Feynman** | Clarity enforcer, first‑principles auditor |
+| **Jeff Bezos** | Scalability judge, working‑backwards strategist |
+| **Daniel Kahneman** | Cognitive bias detector, probability calibrator |
+| **Marcus Aurelius** | Virtue tester, resilience stress‑tester |
+
+Full persona definitions are available in [`council_personas/`](council_personas/). You can copy these into your Obsidian vault under `02_The_Council/` to integrate them with the generated Council notes.
 ## Security
 
 - All file writes are **contained within the vault root**; path traversal attempts are blocked.
