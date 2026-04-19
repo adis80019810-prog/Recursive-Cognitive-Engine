@@ -32,6 +32,23 @@ You drop a file into a folder. The AI reads it, figures out the key ideas, and w
 
 Every Sunday night, a **digital janitor** wakes up, cleans out temporary files, and makes sure everything is running smoothly.
 
+## 🏛️ The Council of Advisors (Unique Feature)
+
+Before any note is finalized, the system convenes a **council of four distinct advisors** to debate the quality of the ideas. Each advisor brings a specific lens:
+
+| Advisor | Perspective | What They Challenge |
+| :--- | :--- | :--- |
+| **Kautilya (Chanakya)** | Ancient Indian strategist, author of the *Arthashastra* | Power dynamics, pragmatic governance, realpolitik. *"Is this actually wise in the real world?"* |
+| **Richard Feynman** | Nobel physicist and legendary educator | Technical clarity. *"Can you explain this simply? Where does it break under scrutiny?"* |
+| **Jeff Bezos** | Founder of Amazon | Scalability and ROI. *"Is this worth building? Will it scale beyond a hobby?"* |
+| **Daniel Kahneman** | Nobel economist, author of *Thinking, Fast and Slow* | Cognitive biases. *"What mental shortcuts are you taking? What are you not seeing?"* |
+
+**How the debate works:**
+1. **Critic Pass:** Claude acts as a devil's advocate and critiques the AI‑generated summary.
+2. **Synthesis Pass:** Claude synthesizes the original summary with the critique into a balanced, nuanced assessment.
+3. **Permanent Record:** The full debate is saved to `02_Council_Debates/` as a permanent audit trail of the thinking behind each batch of notes.
+
+This feature ensures the AI doesn't just summarize—it **questions itself** from multiple worldviews before you ever see the output.
 ---
 
 ## 🛡️ Why This Is Different From "Just Using ChatGPT"
